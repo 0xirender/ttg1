@@ -1,0 +1,168 @@
+name: Telegram Channel Automation (GUI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_cycles:
+        description: 'Number of channel cycles (Default: 0 = Infinite / Continuous Loop)'
+        required: false
+        default: '0'
+        type: string
+      cycle_break_min:
+        description: 'Minimum break time between cycles (seconds)'
+        required: false
+        default: '120'
+        type: string
+      cycle_break_max:
+        description: 'Maximum break time between cycles (seconds)'
+        required: false
+        default: '300'
+        type: string
+
+  # Optional: Uncomment below to trigger automatically on a recurring schedule
+  # schedule:
+  #   - cron: '0 */6 * * *'  # Runs every 6 hours
+
+jobs:
+  run-automation:
+    name: Run Automation in Virtual GUI Display (Infinite Continuous Mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Set up Node.js (Latest)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'latest'
+
+      - name: 4. Install Xvfb, VNC, noVNC & Latest Google Chrome
+        run: |
+          sudo apt-get update
+          # Upgrade Google Chrome to latest version
+          sudo apt-get --only-upgrade install -y google-chrome-stable || sudo apt-get install -y google-chrome-stable
+          # Install Xvfb, VNC, noVNC and GUI tools
+          sudo apt-get install -y xvfb x11vnc novnc python3-websockify fluxbox
+          # Ensure direct link for index.html
+          sudo ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+          # Verify Google Chrome version
+          google-chrome --version
+
+      - name: 5. Install cloudflared (Cloudflare Tunnel)
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: 6. Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: 7. Reconstruct Configuration & Session from Secrets
+        env:
+          CONFIG_FILE_SECRET: ${{ secrets.CONFIG_PY }}
+          SECRET_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: |
+          # If user placed full config.py text in secrets, generate config.py dynamically
+          if [ -n "$CONFIG_FILE_SECRET" ]; then
+            cp config.py config.py.bak 2>/dev/null || true
+            printf "%s\n" "$CONFIG_FILE_SECRET" > config.py
+            if ! python -c "import config" >/dev/null 2>&1; then
+              echo "[!] Warning: The CONFIG_PY secret caused an import error (e.g. empty int cast). Falling back to safe repo config.py."
+              cp config.py.bak config.py 2>/dev/null || true
+            else
+              echo "[+] Successfully created config.py dynamically from CONFIG_PY secret."
+            fi
+          fi
+
+          if [ -z "$SECRET_SESSION" ]; then
+            echo "::error::GitHub Secret 'TELEGRAM_SESSION' is missing! Please configure it under Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          # Write secret string into session.dat
+          printf "%s\n" "$SECRET_SESSION" > session.dat
+          chmod 600 session.dat
+          echo "[+] Successfully generated session.dat from GitHub Secret."
+
+      - name: 8. Run Telegram Automation with Live Cloudflare GUI Stream
+        env:
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          LOCAL_WEB_URL: ${{ secrets.LOCAL_WEB_URL }}
+          CHANNELS_SOURCE_URL: ${{ secrets.CHANNELS_SOURCE_URL }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # 1. Start virtual desktop Xvfb on display :99
+          echo "[*] Starting Xvfb virtual desktop (1920x1080 24-bit color on :99)..."
+          Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+          export DISPLAY=:99
+          sleep 2
+
+          # 2. Start lightweight window manager
+          fluxbox &
+          sleep 1
+
+          # 3. Start x11vnc to share display :99 over VNC (port 5900)
+          echo "[*] Starting x11vnc server on port 5900..."
+          x11vnc -display :99 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 -bg
+
+          # 4. Start noVNC (websockify bridge to HTML5 VNC client on port 6080)
+          echo "[*] Starting noVNC web server on port 6080..."
+          websockify --web /usr/share/novnc 6080 127.0.0.1:5900 &
+          sleep 2
+
+          # 5. Launch Cloudflare Quick Tunnel to expose port 6080 publicly
+          echo "[*] Launching Cloudflare Tunnel for live browser GUI access..."
+          cloudflared tunnel --url http://127.0.0.1:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+
+          # Wait for Cloudflare Tunnel URL to be generated
+          GUI_URL=""
+          for i in {1..20}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              GUI_URL="$TUNNEL_URL/vnc.html?autoconnect=true&resize=scale"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "=================================================================="
+          if [ -n "$GUI_URL" ]; then
+            echo " [★] LIVE VIRTUAL DESKTOP GUI URL (OPEN IN ANY BROWSER):"
+            echo "     $GUI_URL"
+            echo "=================================================================="
+            echo "::notice title=Live Cloudflare GUI URL::$GUI_URL"
+          else
+            echo " [!] Cloudflare Tunnel URL is generating in background. Check /tmp/cloudflared.log."
+            echo "=================================================================="
+          fi
+
+          # 6. Prepare automation command
+          MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
+          BREAK_MIN="${{ github.event.inputs.cycle_break_min || '120' }}"
+          BREAK_MAX="${{ github.event.inputs.cycle_break_max || '300' }}"
+
+          CMD="python run_session.py --cycle-break-min $BREAK_MIN --cycle-break-max $BREAK_MAX"
+
+          # Only set --max-cycles if user explicitly requested a finite number > 0
+          if [ -n "$MAX_CYCLES" ] && [ "$MAX_CYCLES" != "0" ] && [ "$MAX_CYCLES" != "infinite" ]; then
+            CMD="$CMD --max-cycles $MAX_CYCLES"
+            echo "[*] Execution Mode: Finite run ($MAX_CYCLES cycle(s))"
+          else
+            echo "[*] Execution Mode: INFINITE CONTINUOUS LOOP (Runs non-stop until action timeout)"
+          fi
+
+          echo "[*] Launching Chrome in full virtual GUI desktop..."
+          echo "    Executing: $CMD"
+
+          $CMD
